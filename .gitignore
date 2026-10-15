@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.bak.*
+
+# Claude Code per-project agent state (contains absolute local paths)
+.claude/

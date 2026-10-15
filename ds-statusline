@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""A Claude Code status line that reports true context usage and cost.
+
+## Why this exists
+
+Claude Code identifies models by name. When you point it at a provider it does not
+recognise -- anything through `ANTHROPIC_BASE_URL`, or any model id that is not a
+`claude-*` name -- its context-window resolver falls back to a hardcoded 200000
+tokens. Everything the CLI derives from that window is then wrong:
+
+  * the context percentage, computed as `tokens / 200000`
+  * auto-compaction, which triggers at ~92% of the assumed window rather than the
+    real one, so long-running sessions are compacted far too early
+  * `/cost`, which routes through an "unknown model cost" path and prices your
+    tokens with an Anthropic rate table
+
+Claude Code does hand the status line a JSON payload on stdin containing the raw,
+provider-agnostic truth. This script recomputes the display from that instead:
+
+  context  <- context_window.total_input_tokens, against the real window
+  cost     <- summed from the session transcript, priced at your provider's rates
+  balance  <- an optional balance endpoint (DeepSeek's is built in)
+
+## Install
+
+Register it in `~/.claude/settings.json` (see install.sh for an automated path):
+
+    {
+      "statusLine": {
+        "type": "command",
+        "command": "~/.claude/ds-statusline"
+      }
+    }
+
+For DeepSeek, also apply the model configuration in DeepSeek's own Claude Code
+guide, <https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code>:
+
+    ANTHROPIC_MODEL=deepseek-flash[1m]
+    ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-flash[1m]
+    ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-flash[1m]
+    ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-flash
+    CLAUDE_CODE_SUBAGENT_MODEL=deepseek-flash
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW=786432
+
+The `[1m]` suffix makes the CLI's own resolver return 1M rather than 200k, which is
+what corrects auto-compaction; this script only corrects the display.
+
+## Configuration
+
+Everything is optional; the defaults target DeepSeek.
+
+    DS_CONTEXT_WINDOW    Context window in tokens. Default: the detected model's
+                         window, else 1048576.
+    DS_PRICING_JSON      Full pricing override, e.g.
+                         '{"peak":{"cache_hit":0.006,"cache_miss":0.3,"output":1.2},
+                           "offpeak":{"cache_hit":0.003,"cache_miss":0.15,"output":0.6}}'
+                         Prices are USD per 1M tokens.
+    DS_BALANCE_URL       Balance endpoint. Default: DeepSeek's. Empty string disables.
+    DS_BALANCE_DISABLE   Set to 1 to skip the balance request entirely.
+    DS_FORCE_OFFPEAK     Set to 1 to ignore peak pricing.
+    DS_CURRENCY          Force the balance currency label.
+
+No credentials are stored in this file. The API key is read at run time from
+`ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`, falling back to the `env` block of
+`~/.claude/settings.json`.
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+CLAUDE_DIR = os.path.join(os.path.expanduser("~"), ".claude")
+CACHE_FILE = os.path.join(CLAUDE_DIR, ".ds-statusline-cache.json")
+BALANCE_FILE = os.path.join(CLAUDE_DIR, ".ds-balance-cache.json")
+
+BAR_WIDTH = 10
+DEFAULT_WINDOW = 1_048_576
+DEFAULT_BALANCE_URL = "https://api.deepseek.com/user/balance"
+DEFAULT_BALANCE_TTL = 60
+
+# DeepSeek pricing, USD per 1M tokens, from
+# <https://api-docs.deepseek.com/quick_start/pricing>.
+#
+# Every DeepSeek model currently in service has a 1M window and 384K max output.
+#
+# Migration note (2026-09-10 release notes): DeepSeek-V4-Pro is being phased out.
+# Since 04:00 UTC on 2026-09-14 every `deepseek-v4-pro` request has been served by
+# V4.1-Flash and *billed at V4.1-Flash rates*, until V4.1-Pro launches. The Pro
+# preset below therefore carries Flash rates today; the Pro column to restore when
+# V4.1-Pro ships is:
+#
+#     peak    {"cache_hit": 0.044, "cache_miss": 1.32, "output": 3.96}
+#     offpeak {"cache_hit": 0.022, "cache_miss": 0.66, "output": 1.98}
+#
+PRESETS = {
+    "deepseek-flash": {
+        "window": 1_048_576,
+        "peak": {"cache_hit": 0.006, "cache_miss": 0.30, "output": 1.20},
+        "offpeak": {"cache_hit": 0.003, "cache_miss": 0.15, "output": 0.60},
+    },
+    "deepseek-v4-pro": {
+        "window": 1_048_576,
+        "peak": {"cache_hit": 0.006, "cache_miss": 0.30, "output": 1.20},
+        "offpeak": {"cache_hit": 0.003, "cache_miss": 0.15, "output": 0.60},
+    },
+}
+
+# Model ids DeepSeek accepts, mapped onto a preset. Verified against the live API:
+# `deepseek-chat` and `deepseek-reasoner` are still accepted and still resolve to
+# the current 1M model (a 160K-token request succeeds), so they are Flash-priced.
+ALIASES = {
+    "deepseek-flash": "deepseek-flash",
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash",
+    "deepseek-chat": "deepseek-flash",
+    "deepseek-reasoner": "deepseek-flash",
+    "deepseek-v4-pro": "deepseek-v4-pro",
+}
+
+# Peak = 01:00-04:00 and 06:00-10:00 UTC, Monday-Friday, excluding Chinese public
+# holidays; weekends are off-peak in full. Holiday dates are not modelled, so a
+# holiday weekday is priced as peak -- an over-estimate, never an under-estimate.
+PEAK_RANGES = ((1, 4), (6, 10))
+
+_SETTINGS_ENV = None
+
+
+def env_flag(name):
+    return bool(os.environ.get(name))
+
+
+def settings_env():
+    """The `env` block of ~/.claude/settings.json, read once per run."""
+    global _SETTINGS_ENV
+    if _SETTINGS_ENV is None:
+        try:
+            with open(os.path.join(CLAUDE_DIR, "settings.json"), encoding="utf-8") as fh:
+                _SETTINGS_ENV = json.load(fh).get("env") or {}
+        except (OSError, ValueError):
+            _SETTINGS_ENV = {}
+    return _SETTINGS_ENV
+
+
+def setting(name, default=""):
+    """Read a setting from the environment, falling back to settings.json."""
+    value = os.environ.get(name) or settings_env().get(name)
+    return str(value) if value else default
+
+
+def normalize(model_id):
+    """Reduce a model id to a comparable form.
+
+    Strips the `[1m]` suffix the CLI is told about but never sends, and any
+    provider prefix such as `deepseek/deepseek-flash`.
+    """
+    name = (model_id or "").strip().lower()
+    if name.endswith("[1m]"):
+        name = name[:-4].strip()
+    return name.rsplit("/", 1)[-1]
+
+
+def detect_preset(model_id):
+    """Map a raw model id onto a preset key. Returns None for unknown models."""
+    name = normalize(model_id)
+    if name in ALIASES:
+        return ALIASES[name]
+
+    # When the endpoint is DeepSeek's, the server maps Claude model names for you:
+    # claude-opus* -> deepseek-v4-pro, claude-haiku*/claude-sonnet* -> deepseek-flash.
+    # Only apply that here if the configured base URL really is DeepSeek's.
+    if name.startswith("claude-") and "deepseek" in setting("ANTHROPIC_BASE_URL"):
+        if "opus" in name:
+            return "deepseek-v4-pro"
+        if "haiku" in name or "sonnet" in name:
+            return "deepseek-flash"
+        return None
+
+    if "deepseek" in name:
+        if "pro" in name:
+            return "deepseek-v4-pro"
+        if "flash" in name or "chat" in name or "reasoner" in name:
+            return "deepseek-flash"
+    return None
+
+
+def pricing(model_id):
+    """Resolve the pricing table for this model. Returns (table, preset_window)."""
+    override = os.environ.get("DS_PRICING_JSON")
+    if override:
+        try:
+            return json.loads(override), None
+        except ValueError:
+            pass
+    preset = PRESETS.get(detect_preset(model_id))
+    if preset:
+        return preset, preset.get("window")
+    return None, None
+
+
+def parse_token_count(raw):
+    """Parse '786432', '500k' or '1M' into an int, or None.
+
+    Claude Code accepts the suffixed forms in CLAUDE_CODE_AUTO_COMPACT_WINDOW, so
+    accepting them here keeps the two consistent.
+    """
+    text = str(raw or "").strip().lower().replace("_", "").replace(",", "")
+    if not text or text == "auto":
+        return None
+    multiplier = 1
+    for suffix, factor in (("k", 1_000), ("m", 1_000_000)):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+            multiplier = factor
+            break
+    try:
+        value = float(text) * multiplier
+    except ValueError:
+        return None
+    return int(value) if value > 0 else None
+
+
+def context_window(model_id):
+    explicit = parse_token_count(setting("DS_CONTEXT_WINDOW"))
+    if explicit:
+        return explicit
+    _, preset_window = pricing(model_id)
+    return preset_window or DEFAULT_WINDOW
+
+
+def compact_window():
+    """The auto-compact threshold, if the caller configured one."""
+    return parse_token_count(setting("CLAUDE_CODE_AUTO_COMPACT_WINDOW"))
+
+
+def is_peak(now):
+    if env_flag("DS_FORCE_OFFPEAK"):
+        return False
+    if now.weekday() >= 5:
+        return False
+    return any(start <= now.hour < end for start, end in PEAK_RANGES)
+
+
+def api_key():
+    return setting("ANTHROPIC_AUTH_TOKEN") or setting("ANTHROPIC_API_KEY")
+
+
+def aggregate(path):
+    """Sum usage over the whole session transcript.
+
+    Assistant records repeat in the JSONL -- once per streamed update of the same
+    message -- so records are de-duplicated by message.id. Summing without that
+    de-duplication overstates cost several-fold.
+
+    The result is memoised on (size, mtime) because the status line re-renders far
+    more often than the transcript grows.
+    """
+    if not path:
+        return None
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+
+    memo_key = f"{stat.st_size}:{stat.st_mtime_ns}"
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as fh:
+            memo = json.load(fh)
+        if memo.get("path") == path and memo.get("key") == memo_key:
+            return memo.get("totals")
+    except (OSError, ValueError):
+        pass
+
+    totals = {"cache_hit": 0, "cache_miss": 0, "output": 0, "context": 0}
+    seen = set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if record.get("type") != "assistant":
+                    continue
+                message = record.get("message") or {}
+                usage = message.get("usage") or {}
+                message_id = message.get("id")
+                if message_id:
+                    if message_id in seen:
+                        continue
+                    seen.add(message_id)
+                hit = usage.get("cache_read_input_tokens") or 0
+                miss = (usage.get("input_tokens") or 0) + (
+                    usage.get("cache_creation_input_tokens") or 0
+                )
+                totals["cache_hit"] += hit
+                totals["cache_miss"] += miss
+                totals["output"] += usage.get("output_tokens") or 0
+                # Records are chronological, so the last one seen is the live context.
+                totals["context"] = hit + miss
+    except OSError:
+        return None
+
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"path": path, "key": memo_key, "totals": totals}, fh)
+    except OSError:
+        pass
+    return totals
+
+
+def parse_balance(payload):
+    """Extract a human-readable balance from a provider response.
+
+    Handles DeepSeek's shape (`balance_infos: [{currency, total_balance}]`) and
+    falls back to a few common field names for other providers.
+    """
+    infos = payload.get("balance_infos")
+    if isinstance(infos, list) and infos:
+        info = infos[0] or {}
+        amount = info.get("total_balance")
+        if amount is not None:
+            currency = os.environ.get("DS_CURRENCY") or info.get("currency") or ""
+            return f"{currency} {float(amount):.2f}".strip()
+    for key in ("balance", "total_balance", "remaining", "credits"):
+        if payload.get(key) is not None:
+            try:
+                currency = os.environ.get("DS_CURRENCY") or payload.get("currency") or ""
+                return f"{currency} {float(payload[key]):.2f}".strip()
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def balance(ttl=DEFAULT_BALANCE_TTL):
+    """Remaining credit, cached so the status line stays cheap to re-render."""
+    if env_flag("DS_BALANCE_DISABLE"):
+        return None
+    url = os.environ.get("DS_BALANCE_URL", DEFAULT_BALANCE_URL)
+    if not url:
+        return None
+
+    now = time.time()
+    try:
+        with open(BALANCE_FILE, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if cached.get("url") == url and now - cached.get("ts", 0) < ttl:
+            return cached.get("text")
+    except (OSError, ValueError):
+        pass
+
+    text = None
+    key = api_key()
+    if key:
+        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+        try:
+            with urllib.request.urlopen(request, timeout=2.5) as response:
+                text = parse_balance(json.loads(response.read().decode("utf-8")))
+        except Exception:
+            text = None
+
+    try:
+        with open(BALANCE_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"ts": now, "text": text, "url": url}, fh)
+    except OSError:
+        pass
+    return text
+
+
+def format_tokens(value):
+    if value >= 1_000_000:
+        return f"{value / 1_048_576:.1f}M"
+    return f"{value / 1000:.0f}k"
+
+
+def format_cost(amount):
+    if amount < 0.1:
+        return f"${amount:.4f}"
+    return f"${amount:.3f}"
+
+
+def render(payload):
+    model = (payload.get("model") or {}).get("display_name") or "model"
+    # The "[1m]" suffix that raises the CLI's assumed window is not part of the
+    # model name the provider sees, so keep it out of the display.
+    model = model.replace("[1m]", "").strip() or "model"
+
+    window = context_window(model)
+    used = (payload.get("context_window") or {}).get("total_input_tokens") or 0
+    percent = max(0.0, min(100.0, used / window * 100)) if window else 0.0
+    filled = int(round(percent / (100.0 / BAR_WIDTH)))
+    bar = "█" * filled + "░" * (BAR_WIDTH - filled)
+
+    # The threshold at which auto-compaction discards older messages -- the number
+    # that actually decides when context is lost.
+    threshold = compact_window()
+    context_detail = f"{format_tokens(used)}/{format_tokens(window)}"
+    if threshold and threshold < window:
+        context_detail += f" · compact@{format_tokens(threshold)}"
+
+    now = datetime.now(timezone.utc)
+    peak = is_peak(now)
+
+    table, _ = pricing(model)
+    totals = aggregate(payload.get("transcript_path") or "")
+    if table and totals:
+        rates = table["peak" if peak else "offpeak"]
+        cost = (
+            totals["cache_hit"] * rates["cache_hit"]
+            + totals["cache_miss"] * rates["cache_miss"]
+            + totals["output"] * rates["output"]
+        ) / 1_000_000
+        cost_text = format_cost(cost)
+    else:
+        cost_text = "$-"
+
+    lines = [f"{model}  ctx {bar} {percent:4.1f}%  ({context_detail})"]
+
+    parts = [cost_text]
+    credit = balance()
+    if credit:
+        parts.append(f"bal {credit}")
+    if table:
+        parts.append("peak" if peak else "off-peak")
+    lines.append("  ·  ".join(parts))
+    return "\n".join(lines)
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except (ValueError, OSError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    try:
+        print(render(payload))
+    except Exception:
+        # A status line must never break the session: degrade to the model name.
+        try:
+            name = ((payload.get("model") or {}).get("display_name") or "")
+            print(name.replace("[1m]", "").strip() or "claude-code")
+        except Exception:
+            print("claude-code")
+
+
+if __name__ == "__main__":
+    main()
